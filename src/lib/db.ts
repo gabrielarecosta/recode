@@ -1075,6 +1075,92 @@ class LocalStorageDb {
     });
     this.setStorageItem('email_settings', updated);
   }
+
+  // Convert a quote to a client project (local fallback)
+  convertQuoteToProject(quoteId: string, finalMonthlyAbono?: number): ClientProject {
+    const quotes = this.getQuotes();
+    const quote = quotes.find(q => q.id === quoteId);
+    if (!quote) throw new Error('Cotización no encontrada');
+
+    this.updateQuoteStatus(quoteId, 'convertida');
+
+    const rand = Math.floor(1000 + Math.random() * 9000);
+    const projectCode = `RC-PRJ-2026-${rand}`;
+    const startDate = new Date().toISOString().split('T')[0];
+    const weeks = quote.estimated_weeks || 12;
+    const estimatedDeliveryDate = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7 * weeks).toISOString().split('T')[0];
+    const phases: ProjectPhase[] = [
+      { phaseNumber: 1, title: 'Fase 1: Relevamiento y Alcance', status: 'en_proceso', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 10).toISOString().split('T')[0], description: 'Definición de funcionalidades y diseño de base de datos.' },
+      { phaseNumber: 2, title: 'Fase 2: Diseño UX/UI', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 20).toISOString().split('T')[0], description: 'Wireframes interactivos del sistema.' },
+      { phaseNumber: 3, title: 'Fase 3: Desarrollo Core Frontend & Backend', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 45).toISOString().split('T')[0], description: 'Codificación del sistema.' },
+      { phaseNumber: 4, title: 'Fase 4: Integraciones y Pruebas', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 60).toISOString().split('T')[0], description: 'Pruebas de velocidad y SEO.' },
+      { phaseNumber: 5, title: 'Fase 5: Lanzamiento y Capacitación', status: 'pendiente', progress: 0, estimatedDate: estimatedDeliveryDate, description: 'Subida a producción y capacitación.' }
+    ];
+
+    const newProject: ClientProject = {
+      id: `p-${Date.now()}`,
+      projectCode,
+      quoteId,
+      userId: quote.userId || '',
+      name: `${quote.companyName || 'Proyecto'} Core`,
+      status: 'activo',
+      startDate,
+      estimatedDeliveryDate,
+      assignedPM: 'Tomas Recode',
+      progress: 0,
+      phases,
+      createdAt: new Date().toISOString()
+    };
+
+    this.saveClientProject(newProject);
+
+    const abonoValue = finalMonthlyAbono || quote.estimated_min;
+    const payments: Payment[] = [];
+    for (let i = 1; i <= 12; i++) {
+      const dueDate = new Date();
+      dueDate.setMonth(dueDate.getMonth() + (i - 1));
+      payments.push({
+        id: `pay-${Date.now()}-${i}`,
+        userId: newProject.userId,
+        projectId: newProject.id,
+        amount: abonoValue,
+        period: `Abono Mensual (Cuota ${i}/12)`,
+        status: i === 1 ? 'pagado' : 'pendiente',
+        dueDate: dueDate.toISOString().split('T')[0],
+        paidAt: i === 1 ? new Date().toISOString() : undefined,
+        comprobanteUploaded: false
+      });
+    }
+    const existing = this.getPayments();
+    this.setStorageItem('payments', [...existing, ...payments]);
+
+    return newProject;
+  }
+
+  // Update a specific phase inside a client project (local fallback)
+  updateProjectPhase(projectId: string, phaseNumber: number, status: ProjectPhase['status'], progress: number, date?: string, desc?: string): void {
+    const projects = this.getClientProjects();
+    const updated = projects.map(p => {
+      if (p.id !== projectId) return p;
+      const updatedPhases = p.phases.map(ph => {
+        if (ph.phaseNumber !== phaseNumber) return ph;
+        return { ...ph, status, progress, estimatedDate: date || ph.estimatedDate, description: desc || ph.description };
+      });
+      const totalProgress = Math.round(updatedPhases.reduce((acc, ph) => acc + ph.progress, 0) / updatedPhases.length);
+      return { ...p, phases: updatedPhases, progress: totalProgress };
+    });
+    this.setStorageItem('client_projects', updated);
+  }
+
+  // Update the assigned PM and/or delivery date of a project (local fallback)
+  updateProjectPM(projectId: string, assignedPM: string, estimatedDeliveryDate?: string): void {
+    const projects = this.getClientProjects();
+    const updated = projects.map(p => {
+      if (p.id !== projectId) return p;
+      return { ...p, assignedPM, ...(estimatedDeliveryDate ? { estimatedDeliveryDate } : {}) };
+    });
+    this.setStorageItem('client_projects', updated);
+  }
 }
 
 export const localDb = new LocalStorageDb();
@@ -1268,15 +1354,20 @@ export const dbClient = {
   },
 
   async submitQuote(quote: Omit<Quote, 'id' | 'created_at'>): Promise<boolean> {
+    const generatedId = `quote-${Date.now()}`;
     const fullQuote: Quote = {
       ...quote,
-      id: `quote-${Date.now()}`,
+      id: generatedId,
       created_at: new Date().toISOString()
     };
 
     if (isSupabaseConfigured && supabase) {
       await supabase.from('quotes').insert({
-        lead_id: quote.lead_id,
+        lead_id: quote.lead_id || null,
+        user_id: quote.userId || null,
+        quote_code: quote.quoteCode || null,
+        company_name: quote.companyName || null,
+        status: quote.status || 'pendiente',
         project_type: quote.project_type,
         selected_modules: quote.selected_modules,
         complexity: quote.complexity,
@@ -1422,7 +1513,26 @@ export const dbClient = {
   async getQuotes(): Promise<Quote[]> {
     if (isSupabaseConfigured && supabase) {
       const { data, error } = await supabase.from('quotes').select('*').order('created_at', { ascending: false });
-      if (!error && data) return data as Quote[];
+      if (!error && data) {
+        return data.map(q => ({
+          id: q.id,
+          lead_id: q.lead_id,
+          userId: q.user_id,
+          quoteCode: q.quote_code,
+          companyName: q.company_name,
+          status: q.status,
+          project_type: q.project_type,
+          selected_modules: q.selected_modules,
+          complexity: q.complexity,
+          estimated_min: Number(q.estimated_min),
+          estimated_max: Number(q.estimated_max),
+          estimated_weeks: q.estimated_weeks,
+          currency: q.currency,
+          notes: q.notes,
+          created_at: q.created_at,
+          updated_at: q.updated_at
+        })) as Quote[];
+      }
     }
     return localDb.getQuotes();
   },
@@ -1510,6 +1620,37 @@ export const dbClient = {
 
   // Client Auth Operations
   async signUp(user: Omit<User, 'id' | 'createdAt'>): Promise<{ success: boolean; user?: User; error?: string }> {
+    if (isSupabaseConfigured && supabase) {
+      const { data: existing } = await supabase.from('clients').select('id').eq('email', user.email).limit(1);
+      if (existing && existing.length > 0) {
+        return { success: false, error: 'El email ya se encuentra registrado.' };
+      }
+      
+      const { data, error } = await supabase.from('clients').insert({
+        name: user.name,
+        email: user.email,
+        whatsapp: user.whatsapp,
+        company_name: user.companyName,
+        password: user.password
+      }).select().single();
+      
+      if (!error && data) {
+        return {
+          success: true,
+          user: {
+            id: data.id,
+            name: data.name,
+            email: data.email,
+            whatsapp: data.whatsapp,
+            companyName: data.company_name,
+            createdAt: data.created_at
+          }
+        };
+      }
+      return { success: false, error: error?.message || 'Error al registrar cliente.' };
+    }
+    
+    // Fallback
     const users = localDb.getUsers();
     const exists = users.find(u => u.email.toLowerCase() === user.email.toLowerCase());
     if (exists) {
@@ -1525,6 +1666,30 @@ export const dbClient = {
   },
 
   async signInClient(email: string, password: string): Promise<{ success: boolean; user?: User; error?: string }> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.from('clients')
+        .select('*')
+        .eq('email', email.toLowerCase().trim())
+        .eq('password', password)
+        .limit(1);
+      if (!error && data && data.length > 0) {
+        const c = data[0];
+        return {
+          success: true,
+          user: {
+            id: c.id,
+            name: c.name,
+            email: c.email,
+            whatsapp: c.whatsapp,
+            companyName: c.company_name,
+            createdAt: c.created_at
+          }
+        };
+      }
+      return { success: false, error: 'Credenciales inválidas.' };
+    }
+    
+    // Fallback
     const users = localDb.getUsers();
     const found = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.password === password);
     if (found) {
@@ -1534,11 +1699,60 @@ export const dbClient = {
   },
 
   async getQuotesByUserId(userId: string): Promise<Quote[]> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.from('quotes')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+      if (!error && data) {
+        return data.map(q => ({
+          id: q.id,
+          lead_id: q.lead_id,
+          userId: q.user_id,
+          quoteCode: q.quote_code,
+          companyName: q.company_name,
+          status: q.status,
+          project_type: q.project_type,
+          selected_modules: q.selected_modules,
+          complexity: q.complexity,
+          estimated_min: Number(q.estimated_min),
+          estimated_max: Number(q.estimated_max),
+          estimated_weeks: q.estimated_weeks,
+          currency: q.currency,
+          notes: q.notes,
+          created_at: q.created_at,
+          updated_at: q.updated_at
+        })) as Quote[];
+      }
+    }
     const quotes = localDb.getQuotes();
     return quotes.filter(q => q.userId === userId);
   },
 
   async getClientProjects(userId?: string): Promise<ClientProject[]> {
+    if (isSupabaseConfigured && supabase) {
+      let query = supabase.from('client_projects').select('*').order('created_at', { ascending: false });
+      if (userId) {
+        query = query.eq('user_id', userId);
+      }
+      const { data, error } = await query;
+      if (!error && data) {
+        return data.map(p => ({
+          id: p.id,
+          projectCode: p.project_code,
+          quoteId: p.quote_id,
+          userId: p.user_id,
+          name: p.name,
+          status: p.status,
+          startDate: p.start_date,
+          estimatedDeliveryDate: p.estimated_delivery_date,
+          assignedPM: p.assigned_pm,
+          progress: p.progress,
+          phases: p.phases,
+          createdAt: p.created_at
+        })) as ClientProject[];
+      }
+    }
     const projects = localDb.getClientProjects();
     if (userId) {
       return projects.filter(p => p.userId === userId);
@@ -1547,106 +1761,128 @@ export const dbClient = {
   },
 
   async convertQuoteToProject(quoteId: string, finalMonthlyAbono?: number): Promise<ClientProject> {
-    const quotes = localDb.getQuotes();
-    const quote = quotes.find(q => q.id === quoteId);
-    if (!quote) throw new Error('Cotización no encontrada');
-    
-    // Update quote status
-    localDb.updateQuoteStatus(quoteId, 'convertida');
-    
-    // Create new project
-    const rand = Math.floor(1000 + Math.random() * 9000);
-    const newProject: ClientProject = {
-      id: `p-${Date.now()}`,
-      projectCode: `RC-PRJ-2026-${rand}`,
-      quoteId: quote.id,
-      userId: quote.userId || '',
-      name: `${quote.companyName || 'Proyecto'} Core`,
-      status: 'activo',
-      startDate: new Date().toISOString().split('T')[0],
-      estimatedDeliveryDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 7 * quote.estimated_weeks).toISOString().split('T')[0],
-      assignedPM: 'Tomas Recode',
-      progress: 0,
-      createdAt: new Date().toISOString(),
-      phases: [
+    if (isSupabaseConfigured && supabase) {
+      const { data: quoteData, error: quoteErr } = await supabase.from('quotes').select('*').eq('id', quoteId).single();
+      if (quoteErr || !quoteData) throw new Error('Cotización no encontrada');
+      
+      await supabase.from('quotes').update({ status: 'convertida', updated_at: new Date().toISOString() }).eq('id', quoteId);
+      
+      const rand = Math.floor(1000 + Math.random() * 9000);
+      const projectCode = `RC-PRJ-2026-${rand}`;
+      const startDate = new Date().toISOString().split('T')[0];
+      const estimatedDeliveryDate = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7 * quoteData.estimated_weeks).toISOString().split('T')[0];
+      const phases = [
         { phaseNumber: 1, title: 'Fase 1: Relevamiento y Alcance', status: 'en_proceso', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 10).toISOString().split('T')[0], description: 'Definición de funcionalidades, pasarelas de pago y diseño de base de datos final.' },
         { phaseNumber: 2, title: 'Fase 2: Diseño UX/UI', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 20).toISOString().split('T')[0], description: 'Wireframes interactivos de la tienda online pública y el panel administrativo.' },
         { phaseNumber: 3, title: 'Fase 3: Desarrollo Core Frontend & Backend', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 45).toISOString().split('T')[0], description: 'Codificación del sistema Next.js, base de datos local y panel administrador de stock.' },
         { phaseNumber: 4, title: 'Fase 4: Integraciones y Pruebas', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 60).toISOString().split('T')[0], description: 'Conexión de Mercado Pago y Correo Argentino. Pruebas de velocidad y SEO.' },
         { phaseNumber: 5, title: 'Fase 5: Lanzamiento y Capacitación', status: 'pendiente', progress: 0, estimatedDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 75).toISOString().split('T')[0], description: 'Subida a servidores de producción, traspaso de dominios y capacitación de uso del panel al equipo.' }
-      ]
-    };
-    localDb.saveClientProject(newProject);
-
-    // Seed 12 monthly payments for the membership
-    const abonoValue = finalMonthlyAbono || quote.estimated_min;
-    for (let i = 1; i <= 12; i++) {
-      const dueDate = new Date();
-      dueDate.setMonth(dueDate.getMonth() + (i - 1));
-      localDb.savePayment({
-        id: `pay-${Date.now()}-${i}`,
-        userId: quote.userId || '',
-        projectId: newProject.id,
-        amount: abonoValue,
-        period: `Abono Mensual (Cuota ${i}/12)`,
-        status: i === 1 ? 'pagado' : 'pendiente',
-        dueDate: dueDate.toISOString().split('T')[0],
-        paidAt: i === 1 ? new Date().toISOString() : undefined
-      });
+      ];
+      
+      const { data: newProject, error: projErr } = await supabase.from('client_projects').insert({
+        project_code: projectCode,
+        quote_id: quoteId,
+        user_id: quoteData.user_id,
+        name: `${quoteData.company_name || 'Proyecto'} Core`,
+        status: 'activo',
+        start_date: startDate,
+        estimated_delivery_date: estimatedDeliveryDate,
+        assigned_pm: 'Tomas Recode',
+        progress: 0,
+        phases: phases
+      }).select().single();
+      
+      if (projErr || !newProject) throw new Error(projErr?.message || 'Error al crear proyecto');
+      
+      const abonoValue = finalMonthlyAbono || Number(quoteData.estimated_min);
+      const paymentsToInsert = [];
+      for (let i = 1; i <= 12; i++) {
+        const dueDate = new Date();
+        dueDate.setMonth(dueDate.getMonth() + (i - 1));
+        paymentsToInsert.push({
+          user_id: quoteData.user_id,
+          project_id: newProject.id,
+          amount: abonoValue,
+          period: `Abono Mensual (Cuota ${i}/12)`,
+          status: i === 1 ? 'pagado' : 'pendiente',
+          due_date: dueDate.toISOString().split('T')[0],
+          paid_at: i === 1 ? new Date().toISOString() : null
+        });
+      }
+      await supabase.from('payments').insert(paymentsToInsert);
+      
+      const { data: clientData } = await supabase.from('clients').select('email, name').eq('id', quoteData.user_id).single();
+      if (clientData) {
+        const formattedPrice = `$ ${abonoValue.toLocaleString('es-AR')}`;
+        const modulesList = quoteData.selected_modules.join(', ');
+        dbClient.sendEmailTrigger('contract_delivery', clientData.email, {
+          name: clientData.name,
+          project_name: newProject.name,
+          price: formattedPrice,
+          modules: modulesList,
+          pm: newProject.assigned_pm
+        });
+      }
+      
+      return {
+        id: newProject.id,
+        projectCode: newProject.project_code,
+        quoteId: newProject.quote_id,
+        userId: newProject.user_id,
+        name: newProject.name,
+        status: newProject.status,
+        startDate: newProject.start_date,
+        estimatedDeliveryDate: newProject.estimated_delivery_date,
+        assignedPM: newProject.assigned_pm,
+        progress: newProject.progress,
+        phases: newProject.phases,
+        createdAt: newProject.created_at
+      } as ClientProject;
     }
-
-    // Trigger Contract email delivery in background
-    const users = localDb.getUsers();
-    const userObj = users.find(u => u.id === quote.userId);
-    if (userObj) {
-      const formattedPrice = `$ ${abonoValue.toLocaleString('es-AR')}`;
-      const modulesList = quote.selected_modules.join(', ');
-      dbClient.sendEmailTrigger('contract_delivery', userObj.email, {
-        name: userObj.name,
-        project_name: newProject.name,
-        price: formattedPrice,
-        modules: modulesList,
-        pm: newProject.assignedPM
-      });
-    }
-
-    return newProject;
+    
+    return localDb.convertQuoteToProject(quoteId, finalMonthlyAbono);
   },
 
   async updateProjectPhase(projectId: string, phaseNumber: number, status: ProjectPhase['status'], progress: number, date?: string, desc?: string): Promise<void> {
-    const projects = localDb.getClientProjects();
-    const project = projects.find(p => p.id === projectId);
-    if (!project) throw new Error('Proyecto no encontrado');
-
-    const updatedPhases = project.phases.map(ph => {
-      if (ph.phaseNumber === phaseNumber) {
-        return {
-          ...ph,
-          status,
-          progress,
-          estimatedDate: date || ph.estimatedDate,
-          description: desc || ph.description
-        };
-      }
-      return ph;
-    });
-
-    const totalProgress = Math.round(updatedPhases.reduce((acc, p) => acc + p.progress, 0) / updatedPhases.length);
-
-    project.phases = updatedPhases;
-    project.progress = totalProgress;
-    localDb.updateClientProject(project);
+    if (isSupabaseConfigured && supabase) {
+      const { data: project, error } = await supabase.from('client_projects').select('phases').eq('id', projectId).single();
+      if (error || !project) throw new Error('Proyecto no encontrado');
+      
+      const currentPhases = project.phases as ProjectPhase[];
+      const updatedPhases = currentPhases.map(ph => {
+        if (ph.phaseNumber === phaseNumber) {
+          return {
+            ...ph,
+            status,
+            progress,
+            estimatedDate: date || ph.estimatedDate,
+            description: desc || ph.description
+          };
+        }
+        return ph;
+      });
+      
+      const totalProgress = Math.round(updatedPhases.reduce((acc, p) => acc + p.progress, 0) / updatedPhases.length);
+      
+      await supabase.from('client_projects').update({
+        phases: updatedPhases,
+        progress: totalProgress
+      }).eq('id', projectId);
+      return;
+    }
+    localDb.updateProjectPhase(projectId, phaseNumber, status, progress, date, desc);
   },
 
   async updateProjectPM(projectId: string, assignedPM: string, estimatedDeliveryDate?: string): Promise<void> {
-    const projects = localDb.getClientProjects();
-    const project = projects.find(p => p.id === projectId);
-    if (!project) throw new Error('Proyecto no encontrado');
-    project.assignedPM = assignedPM;
-    if (estimatedDeliveryDate) {
-      project.estimatedDeliveryDate = estimatedDeliveryDate;
+    if (isSupabaseConfigured && supabase) {
+      const updates: any = { assigned_pm: assignedPM };
+      if (estimatedDeliveryDate) {
+        updates.estimated_delivery_date = estimatedDeliveryDate;
+      }
+      await supabase.from('client_projects').update(updates).eq('id', projectId);
+      return;
     }
-    localDb.updateClientProject(project);
+    localDb.updateProjectPM(projectId, assignedPM, estimatedDeliveryDate);
   },
 
   async updateProjectAbonoAmount(projectId: string, amount: number): Promise<void> {
@@ -1663,6 +1899,26 @@ export const dbClient = {
   },
 
   async getMessages(userId?: string): Promise<Message[]> {
+    if (isSupabaseConfigured && supabase) {
+      let query = supabase.from('messages').select('*').order('created_at', { ascending: true });
+      if (userId) {
+        query = query.eq('user_id', userId);
+      }
+      const { data, error } = await query;
+      if (!error && data) {
+        return data.map(m => ({
+          id: m.id,
+          userId: m.user_id,
+          projectId: m.project_id,
+          quoteId: m.quote_id,
+          category: m.category,
+          message: m.message,
+          sender: m.sender,
+          status: m.status,
+          createdAt: m.created_at
+        })) as Message[];
+      }
+    }
     const messages = localDb.getMessages();
     if (userId) {
       return messages.filter(m => m.userId === userId);
@@ -1671,6 +1927,33 @@ export const dbClient = {
   },
 
   async sendMessage(msg: Omit<Message, 'id' | 'createdAt'>): Promise<Message> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.from('messages').insert({
+        user_id: msg.userId,
+        project_id: msg.projectId || null,
+        quote_id: msg.quoteId || null,
+        category: msg.category,
+        message: msg.message,
+        sender: msg.sender,
+        status: msg.status
+      }).select().single();
+      
+      if (!error && data) {
+        return {
+          id: data.id,
+          userId: data.user_id,
+          projectId: data.project_id,
+          quoteId: data.quote_id,
+          category: data.category,
+          message: data.message,
+          sender: data.sender,
+          status: data.status,
+          createdAt: data.created_at
+        } as Message;
+      }
+    }
+    
+    // Fallback
     const newMsg: Message = {
       ...msg,
       id: `msg-${Date.now()}`,
@@ -1681,6 +1964,26 @@ export const dbClient = {
   },
 
   async getDocuments(userId?: string): Promise<Document[]> {
+    if (isSupabaseConfigured && supabase) {
+      let query = supabase.from('documents').select('*').order('uploaded_at', { ascending: false });
+      if (userId) {
+        query = query.eq('user_id', userId);
+      }
+      const { data, error } = await query;
+      if (!error && data) {
+        return data.map(d => ({
+          id: d.id,
+          userId: d.user_id,
+          projectId: d.project_id,
+          quoteId: d.quote_id,
+          fileName: d.file_name,
+          fileType: d.file_type,
+          fileSize: d.file_size,
+          status: d.status,
+          uploadedAt: d.uploaded_at
+        })) as Document[];
+      }
+    }
     const docs = localDb.getDocuments();
     if (userId) {
       return docs.filter(d => d.userId === userId);
@@ -1689,6 +1992,33 @@ export const dbClient = {
   },
 
   async uploadDocument(doc: Omit<Document, 'id' | 'uploadedAt' | 'status'>): Promise<Document> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.from('documents').insert({
+        user_id: doc.userId,
+        project_id: doc.projectId || null,
+        quote_id: doc.quoteId || null,
+        file_name: doc.fileName,
+        file_type: doc.fileType,
+        file_size: doc.fileSize,
+        status: 'recibido'
+      }).select().single();
+      
+      if (!error && data) {
+        return {
+          id: data.id,
+          userId: data.user_id,
+          projectId: data.project_id,
+          quoteId: data.quote_id,
+          fileName: data.file_name,
+          fileType: data.file_type,
+          fileSize: data.file_size,
+          status: data.status,
+          uploadedAt: data.uploaded_at
+        } as Document;
+      }
+    }
+    
+    // Fallback
     const newDoc: Document = {
       ...doc,
       id: `doc-${Date.now()}`,
@@ -1700,10 +2030,34 @@ export const dbClient = {
   },
 
   async updateDocumentStatus(docId: string, status: Document['status']): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      await supabase.from('documents').update({ status }).eq('id', docId);
+      return;
+    }
     localDb.updateDocumentStatus(docId, status);
   },
 
   async getPayments(userId?: string): Promise<Payment[]> {
+    if (isSupabaseConfigured && supabase) {
+      let query = supabase.from('payments').select('*').order('due_date', { ascending: true });
+      if (userId) {
+        query = query.eq('user_id', userId);
+      }
+      const { data, error } = await query;
+      if (!error && data) {
+        return data.map(p => ({
+          id: p.id,
+          userId: p.user_id,
+          projectId: p.project_id,
+          amount: Number(p.amount),
+          period: p.period,
+          status: p.status,
+          dueDate: p.due_date,
+          paidAt: p.paid_at || undefined,
+          comprobanteUploaded: p.comprobante_uploaded
+        })) as Payment[];
+      }
+    }
     const payments = localDb.getPayments();
     if (userId) {
       return payments.filter(p => p.userId === userId);
@@ -1712,22 +2066,67 @@ export const dbClient = {
   },
 
   async updatePaymentStatus(paymentId: string, status: Payment['status'], paidAt?: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      await supabase.from('payments').update({
+        status,
+        paid_at: paidAt || null
+      }).eq('id', paymentId);
+      return;
+    }
     localDb.updatePaymentStatus(paymentId, status, paidAt);
   },
 
   async uploadPaymentReceipt(paymentId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      await supabase.from('payments').update({
+        comprobante_uploaded: true
+      }).eq('id', paymentId);
+      return;
+    }
     localDb.uploadPaymentReceipt(paymentId);
   },
 
   async getClients(): Promise<User[]> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.from('clients').select('*').order('created_at', { ascending: false });
+      if (!error && data) {
+        return data.map(c => ({
+          id: c.id,
+          name: c.name,
+          email: c.email,
+          whatsapp: c.whatsapp,
+          companyName: c.company_name,
+          createdAt: c.created_at
+        }));
+      }
+    }
     return localDb.getUsers();
   },
 
   async updateQuoteStatus(quoteId: string, status: Quote['status'], comments?: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const updates: any = { status };
+      if (comments !== undefined) {
+        updates.notes = comments;
+      }
+      await supabase.from('quotes').update(updates).eq('id', quoteId);
+      return;
+    }
     localDb.updateQuoteStatus(quoteId, status, comments);
   },
 
   async updateQuoteDetails(quoteId: string, status: Quote['status'], min: number, max: number, weeks: number, notes: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      await supabase.from('quotes').update({
+        status,
+        estimated_min: min,
+        estimated_max: max,
+        estimated_weeks: weeks,
+        notes,
+        updated_at: new Date().toISOString()
+      }).eq('id', quoteId);
+      return;
+    }
     localDb.updateQuoteDetails(quoteId, status, min, max, weeks, notes);
   }
 };
